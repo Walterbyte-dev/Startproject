@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1120">
+  <title>DorControl — Assistance à distance</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1120; --panel:#17243b; --accent:#00d9ff; --muted:#a9b8ce; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:#f5f8ff; font:16px/1.5 Arial,sans-serif; }
+    header { padding:24px 16px; text-align:center; background:#111c33; border-bottom:2px solid var(--accent); }
+    h1 { margin:0; color:var(--accent); letter-spacing:1px; }
+    header p { margin:5px 0 0; color:var(--muted); }
+    main { max-width:760px; margin:22px auto; padding:0 14px; }
+    .card { background:var(--panel); padding:20px; border-radius:16px; margin:14px 0; border:1px solid #293b59; }
+    h2 { margin-top:0; font-size:1.2rem; }
+    input, button { width:100%; padding:13px; border-radius:9px; font-size:1rem; }
+    input { background:#0b1425; color:white; border:1px solid #526582; margin:6px 0 10px; }
+    button { border:0; margin:6px 0; background:var(--accent); color:#06111e; font-weight:bold; cursor:pointer; }
+    button.secondary { background:#31435f; color:white; }
+    button.danger { background:#ff626f; color:#21070a; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .status { min-height:26px; color:#8df7bf; overflow-wrap:anywhere; }
+    .warn { color:#ffd98b; font-size:.92rem; }
+    .video-wrap { background:#05080e; border-radius:12px; overflow:hidden; min-height:160px; display:grid; place-items:center; }
+    video { width:100%; max-height:65vh; background:#05080e; }
+    .hidden { display:none !important; }
+    .code { font-size:1.5rem; font-weight:bold; letter-spacing:3px; color:var(--accent); overflow-wrap:anywhere; }
+    footer { text-align:center; padding:20px; color:var(--muted); font-size:.82rem; }
+    @media (max-width:520px) { .row { grid-template-columns:1fr; } .card { padding:16px; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>DorControl</h1>
+  <p>Partage d'écran à distance, avec autorisation</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. Créer ou rejoindre une session</h2>
+    <p>Sur le téléphone qui partage son écran, crée une session. Sur l'autre appareil, saisis le code reçu.</p>
+    <div class="row">
+      <button id="createBtn">Créer une session</button>
+      <div>
+        <input id="joinCode" placeholder="Code de session" maxlength="8" autocomplete="off">
+        <button id="joinBtn" class="secondary">Rejoindre</button>
+      </div>
+    </div>
+    <div id="sessionInfo" class="hidden">
+      <p>Code de session :</p>
+      <div id="sessionCode" class="code"></div>
+      <button id="copyBtn" class="secondary">Copier le code</button>
+    </div>
+    <p id="status" class="status" role="status">Non connecté à une session.</p>
+  </section>
+
+  <section id="shareCard" class="card hidden">
+    <h2>2. Partager l'écran</h2>
+    <p>Le partage ne commence qu'après ton action et la confirmation dans la fenêtre d'autorisation du navigateur.</p>
+    <button id="shareBtn">Choisir et partager mon écran</button>
+    <button id="stopBtn" class="danger" disabled>Arrêter le partage</button>
+    <p class="warn">Ne partage pas de mots de passe, messages privés ou données sensibles. Tu peux arrêter à tout moment.</p>
+  </section>
+
+  <section id="viewerCard" class="card hidden">
+    <h2>Écran partagé</h2>
+    <div class="video-wrap"><video id="remoteVideo" autoplay playsinline controls></video></div>
+    <p class="warn">Tu vois uniquement l'écran que l'autre utilisateur a choisi de partager. Cette page ne contrôle pas les gestes ni les autres applications du téléphone.</p>
+  </section>
+
+  <section class="card">
+    <h2>À propos de la sécurité</h2>
+    <p>Cette version transmet le flux vidéo directement entre les navigateurs via WebRTC. Le serveur sert à organiser la connexion. Les sessions sont limitées à deux appareils et disparaissent quand tous les participants quittent la session.</p>
+    <p class="warn">Pour utiliser le partage d'écran depuis Internet, héberge le site en HTTPS. Les navigateurs mobiles peuvent limiter le partage d'écran selon le modèle et la version d'Android.</p>
+  </section>
+</main>
+<footer>DorControl · Démonstration d'assistance à distance consentie</footer>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(() => {
+  const socket = io();
+  const $ = (id) => document.getElementById(id);
+  const status = $("status");
+  const createBtn = $("createBtn"), joinBtn = $("joinBtn");
+  const shareBtn = $("shareBtn"), stopBtn = $("stopBtn");
+  const shareCard = $("shareCard"), viewerCard = $("viewerCard");
+  const remoteVideo = $("remoteVideo");
+
+  let role = null;
+  let roomCode = null;
+  let localStream = null;
+  let pc = null;
+  let pendingCandidates = [];
+
+  const rtcConfig = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" }
+    ]
+  };
+
+  function say(message, isError = false) {
+    status.textContent = message;
+    status.style.color = isError ? "#ff9aa3" : "#8df7bf";
+  }
+
+  function setSession(result) {
+    role = result.role;
+    roomCode = result.code;
+    $("sessionCode").textContent = roomCode;
+    $("sessionInfo").classList.remove("hidden");
+    shareCard.classList.toggle("hidden", role !== "host");
+    viewerCard.classList.toggle("hidden", role !== "viewer");
+    createBtn.disabled = true;
+    joinBtn.disabled = true;
+    $("joinCode").disabled = true;
+    say(role === "host"
+      ? "Session créée. Envoie le code à la personne autorisée."
+      : "Connecté à la session. Attends que l'autre personne démarre le partage.");
+  }
+
+  function newPeer() {
+    if (pc) {
+      try { pc.close(); } catch (_) {}
+    }
+    pc = new RTCPeerConnection(rtcConfig);
+    pendingCandidates = [];
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) socket.emit("webrtc-ice", event.candidate);
+    };
+
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        remoteVideo.srcObject = event.streams[0];
+        viewerCard.classList.remove("hidden");
+        say("Écran reçu. L'utilisateur qui partage peut arrêter à tout moment.");
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      if (pc.connectionState === "failed") {
+        say("Connexion impossible. Réessaie ou vérifie le réseau.", true);
+      } else if (pc.connectionState === "disconnected") {
+        say("Connexion interrompue.", true);
+      }
+    };
+    return pc;
+  }
+
+  createBtn.addEventListener("click", () => {
+    socket.emit("create-session", (result) => {
+      if (!result || !result.ok) return say("Impossible de créer la session.", true);
+      setSession(result);
+    });
+  });
+
+  joinBtn.addEventListener("click", () => {
+    const code = $("joinCode").value.trim().toUpperCase();
+    if (!code) return say("Saisis le code de session.", true);
+    socket.emit("join-session", code, (result) => {
+      if (!result || !result.ok) return say(result?.error || "Connexion impossible.", true);
+      setSession(result);
+    });
+  });
+
+  $("copyBtn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode);
+      say("Code copié. Envoie-le à la personne autorisée.");
+    } catch (_) {
+      say("Sélectionne et copie le code affiché.", true);
+    }
+  });
+
+  shareBtn.addEventListener("click", async () => {
+    if (role !== "host") return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      return say("Ce navigateur ne permet pas le partage d'écran ici. Essaie un navigateur compatible et une connexion HTTPS.", true);
+    }
+    try {
+      // The browser must display its own screen-sharing permission picker.
+      localStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false
+      });
+      stopBtn.disabled = false;
+      shareBtn.disabled = true;
+
+      localStream.getTracks().forEach(track => {
+        track.addEventListener("ended", stopSharing);
+      });
+
+      const peer = newPeer();
+      localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      socket.emit("webrtc-offer", peer.localDescription);
+      say("Partage lancé. L'autorisation vient du sélecteur d'écran du navigateur.");
+    } catch (error) {
+      say(error.name === "NotAllowedError"
+        ? "Partage annulé : aucune autorisation accordée."
+        : "Impossible de démarrer le partage : " + error.message, true);
+      stopSharing(false);
+    }
+  });
+
+  async function addPendingCandidates() {
+    if (!pc || !pc.remoteDescription) return;
+    for (const candidate of pendingCandidates) {
+      try { await pc.addIceCandidate(candidate); } catch (_) {}
+    }
+    pendingCandidates = [];
+  }
+
+  socket.on("webrtc-offer", async (offer) => {
+    if (role !== "viewer") return;
+    try {
+      const peer = newPeer();
+      await peer.setRemoteDescription(offer);
+      await addPendingCandidates();
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      socket.emit("webrtc-answer", peer.localDescription);
+      say("Connexion en cours…");
+    } catch (error) {
+      say("Erreur lors de la connexion vidéo : " + error.message, true);
+    }
+  });
+
+  socket.on("webrtc-answer", async (answer) => {
+    if (role !== "host" || !pc) return;
+    try {
+      await pc.setRemoteDescription(answer);
+      await addPendingCandidates();
+    } catch (error) {
+      say("Erreur de négociation : " + error.message, true);
+    }
+  });
+
+  socket.on("webrtc-ice", async (candidate) => {
+    if (!pc) {
+      pendingCandidates.push(candidate);
+      return;
+    }
+    if (!pc.remoteDescription) {
+      pendingCandidates.push(candidate);
+      return;
+    }
+    try { await pc.addIceCandidate(candidate); } catch (_) {}
+  });
+
+  function stopSharing(notify = true) {
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+    }
+    if (pc) {
+      try { pc.close(); } catch (_) {}
+      pc = null;
+    }
+    remoteVideo.srcObject = null;
+    shareBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (notify) socket.emit("stop-sharing");
+    if (role === "host") say("Partage arrêté.");
+  }
+
+  stopBtn.addEventListener("click", () => stopSharing(true));
+  socket.on("sharing-stopped", () => {
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    remoteVideo.srcObject = null;
+    say("Le partage a été arrêté par l'utilisateur.");
+  });
+  socket.on("peer-joined", () => {
+    say("L'autre utilisateur a rejoint la session. Tu peux démarrer le partage.");
+  });
+  socket.on("peer-left", () => {
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    remoteVideo.srcObject = null;
+    say("L'autre utilisateur a quitté la session.", true);
+  });
+  socket.on("connect_error", () => say("Connexion au serveur impossible. Vérifie l'adresse et le réseau.", true));
+
+  window.addEventListener("beforeunload", () => {
+    if (localStream) localStream.getTracks().forEach(track => track.stop());
+    socket.emit("leave-session");
+  });
+})();
+</script>
+</body>
+</html>
